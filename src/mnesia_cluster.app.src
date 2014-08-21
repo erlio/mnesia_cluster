@@ -1,0 +1,23 @@
+{application, mnesia_cluster,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  sasl,
+                  mnesia
+                 ]},
+  {mod, { mnesia_cluster_app, []}},
+  {modules, []},
+  {env, [
+        {table_definition_mod, {mnesia_cluster_table, test_defs, []}},
+        {app_process, init},
+        {cluster_monitor_callbacks, []}, %% have to export on_node_up/1 and on_node_down/1
+        {cluster_nodes, {[], disc}}, %% {TryNodes, NodeType}
+        %{cluster_partition_handling, autoheal}
+        {cluster_partition_handling, pause_minority}
+        
+    ]}
+ ]}.
