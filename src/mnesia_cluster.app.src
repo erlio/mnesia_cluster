@@ -6,7 +6,6 @@
   {applications, [
                   kernel,
                   stdlib,
-                  sasl,
                   mnesia
                  ]},
   {mod, { mnesia_cluster_app, []}},
