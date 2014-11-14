@@ -219,8 +219,8 @@ init([App]) ->
     net_kernel:monitor_nodes(true, [nodedown_reason]),
     {ok, _} = mnesia:subscribe(system),
     {ok, #state{app         = App,
-                monitors    = pmon:new(),
-                subscribers = pmon:new(),
+                monitors    = mnesia_cluster_pmon:new(),
+                subscribers = mnesia_cluster_pmon:new(),
                 partitions  = [],
                 autoheal    = mnesia_cluster_autoheal:init()}}.
 
@@ -235,7 +235,7 @@ handle_call(_Request, _From, State) ->
 %% mnesia propagation.
 handle_cast({node_up, Node, NodeType},
             State = #state{app=App, monitors = Monitors}) ->
-    case pmon:is_monitored({App, Node}, Monitors) of
+    case mnesia_cluster_pmon:is_monitored({App, Node}, Monitors) of
         true  -> {noreply, State};
         false -> error_logger:info_msg("~p on node ~p up~n", [App, Node]),
                  {AllNodes, DiscNodes, RunningNodes} = read_cluster_status(),
@@ -247,7 +247,7 @@ handle_cast({node_up, Node, NodeType},
                                        add_node(Node, RunningNodes)}),
                  ok = handle_live_app(Node),
                  {noreply, State#state{
-                             monitors = pmon:monitor({App, Node}, Monitors)}}
+                             monitors = mnesia_cluster_pmon:monitor({App, Node}, Monitors)}}
     end;
 handle_cast({joined_cluster, Node, NodeType}, State) ->
     {AllNodes, DiscNodes, RunningNodes} = read_cluster_status(),
@@ -264,7 +264,7 @@ handle_cast({left_cluster, Node}, State) ->
                           del_node(Node, RunningNodes)}),
     {noreply, State};
 handle_cast({subscribe, Pid}, State = #state{subscribers = Subscribers}) ->
-    {noreply, State#state{subscribers = pmon:monitor(Pid, Subscribers)}};
+    {noreply, State#state{subscribers = mnesia_cluster_pmon:monitor(Pid, Subscribers)}};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -273,14 +273,14 @@ handle_info({'DOWN', _MRef, process, {App, Node}, _Reason},
     error_logger:info_msg("~p on node ~p down~n", [App, Node]),
     {AllNodes, DiscNodes, RunningNodes} = read_cluster_status(),
     write_cluster_status({AllNodes, DiscNodes, del_node(Node, RunningNodes)}),
-    [P ! {node_down, Node} || P <- pmon:monitored(Subscribers)],
+    [P ! {node_down, Node} || P <- mnesia_cluster_pmon:monitored(Subscribers)],
     {noreply, handle_dead_app(
                 Node,
-                State#state{monitors = pmon:erase({App, Node}, Monitors)})};
+                State#state{monitors = mnesia_cluster_pmon:erase({App, Node}, Monitors)})};
 
 handle_info({'DOWN', _MRef, process, Pid, _Reason},
             State = #state{subscribers = Subscribers}) ->
-    {noreply, State#state{subscribers = pmon:erase(Pid, Subscribers)}};
+    {noreply, State#state{subscribers = mnesia_cluster_pmon:erase(Pid, Subscribers)}};
 
 handle_info({nodedown, Node, Info}, State) ->
     error_logger:info_msg("node ~p down: ~p~n",
@@ -295,10 +295,10 @@ handle_info({mnesia_system_event,
                            autoheal   = AState}) ->
     %% We will not get a node_up from this node - yet we should treat it as
     %% up (mostly).
-    State1 = case pmon:is_monitored({App, Node}, Monitors) of
+    State1 = case mnesia_cluster_pmon:is_monitored({App, Node}, Monitors) of
                  true  -> State;
                  false -> State#state{
-                            monitors = pmon:monitor({App, Node}, Monitors)}
+                            monitors = mnesia_cluster_pmon:monitor({App, Node}, Monitors)}
              end,
     ok = handle_live_app(Node),
     Partitions1 = ordsets:to_list(

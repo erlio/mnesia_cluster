@@ -14,7 +14,7 @@
 %% Copyright (c) 2011-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
--module(pmon).
+-module(mnesia_cluster_pmon).
 
 -export([new/0, new/1, monitor/2, monitor_all/2, demonitor/2,
          is_monitored/2, erase/2, monitored/1, is_empty/1]).
