@@ -287,6 +287,11 @@ handle_info({nodedown, Node, Info}, State) ->
     error_logger:info_msg("node ~p down: ~p~n",
                     [Node, proplists:get_value(nodedown_reason, Info)]),
     {noreply, handle_dead_node(Node, State)};
+handle_info({nodeup, _, _}, State) ->
+    %% we signal the app watcher to redeliver the app alive signal
+    %% this will result in handle_cast({node_up.. on all running nodes
+    mnesia_cluster_app_watcher:rewatch(),
+    {noreply, State};
 
 handle_info({mnesia_system_event,
              {inconsistent_database, running_partitioned_network, Node}},

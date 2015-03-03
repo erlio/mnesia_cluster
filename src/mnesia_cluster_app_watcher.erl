@@ -12,7 +12,8 @@
 %%
 -module(mnesia_cluster_app_watcher).
 -behaviour(gen_server).
--export([start_link/1]).
+-export([start_link/1,
+         rewatch/0]).
 -export([init/1,
          handle_call/3,
          handle_cast/2,
@@ -25,6 +26,15 @@
 start_link(App) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [App], []).
 
+rewatch() ->
+    case whereis(?MODULE) of
+        undefined ->
+            ok;
+        Pid ->
+            Pid ! watch_app,
+            ok
+    end.
+
 init([App]) ->
     {ok, {App, is_app_alive(App)}}.
 
@@ -34,7 +44,13 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Req, State) ->
     {noreply, State}.
 
-handle_info(watch_app, {App, _}) ->
+handle_info(watch_app, {App, MRef}) ->
+    case erlang:is_reference(MRef) of
+        true ->
+            erlang:demonitor(MRef, [flush]);
+        false ->
+            ok
+    end,
     {noreply, {App, is_app_alive(App)}};
 handle_info({'DOWN', _, process, _Pid, _Reason}, {App, _}) ->
     {noreply, {App, is_app_alive(App)}}.
