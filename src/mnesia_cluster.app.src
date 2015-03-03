@@ -1,7 +1,7 @@
 {application, mnesia_cluster,
  [
-  {description, ""},
-  {vsn, "0.0.1"},
+  {description, "A library to simplify development of Mnesia based systems"},
+  {vsn, "0.1.0"},
   {registered, []},
   {applications, [
                   kernel,
@@ -13,7 +13,6 @@
   {env, [
         {table_definition_mod, {mnesia_cluster_table, test_defs, []}},
         {app_process, mnesia_cluster},
-        {cluster_monitor_callbacks, []}, %% have to export on_node_up/1 and on_node_down/1
         {cluster_nodes, {[], disc}}, %% {TryNodes, NodeType}
         %{cluster_partition_handling, ignore}
         %{cluster_partition_handling, autoheal}

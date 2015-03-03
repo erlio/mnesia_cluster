@@ -234,7 +234,7 @@ handle_call(_Request, _From, State) ->
 %% mnesia information since the message can (and will) overtake the
 %% mnesia propagation.
 handle_cast({node_up, Node, NodeType},
-            State = #state{app=App, monitors = Monitors}) ->
+            State = #state{app=App, monitors = Monitors, subscribers = Subscribers}) ->
     case mnesia_cluster_pmon:is_monitored({App, Node}, Monitors) of
         true  -> {noreply, State};
         false -> error_logger:info_msg("~p on node ~p up~n", [App, Node]),
@@ -245,6 +245,7 @@ handle_cast({node_up, Node, NodeType},
                                            ram  -> DiscNodes
                                        end,
                                        add_node(Node, RunningNodes)}),
+                 [P ! {node_up, Node} || P <- mnesia_cluster_pmon:monitored(Subscribers)],
                  ok = handle_live_app(Node),
                  {noreply, State#state{
                              monitors = mnesia_cluster_pmon:monitor({App, Node}, Monitors)}}
@@ -408,7 +409,6 @@ handle_dead_app(Node, State = #state{partitions = Partitions,
     %% lots of nodes.  We really only need to execute some of these
     %% statements on *one* node, rather than all of them.
     ok = mnesia_cluster_utils:on_node_down(Node),
-    monitor_callbacks(Node, on_node_down),
     %% If we have been partitioned, and we are now in the only remaining
     %% partition, we no longer care about partitions - forget them. Note
     %% that we do not attempt to deal with individual (other) partitions
@@ -427,8 +427,7 @@ ensure_ping_timer(State) ->
       State, #state.down_ping_timer, ?MNESIA_CLUSTER_DOWN_PING_INTERVAL, ping_nodes).
 
 handle_live_app(Node) ->
-    ok = mnesia_cluster_utils:on_node_up(Node),
-    monitor_callbacks(Node, on_node_up).
+    ok = mnesia_cluster_utils:on_node_up(Node).
 
 %%--------------------------------------------------------------------
 %% Internal utils
@@ -507,8 +506,3 @@ stop_timer(State, Idx) ->
         TRef      -> erlang:cancel_timer(TRef),
                      setelement(Idx, State, undefined)
     end.
-
-monitor_callbacks(Node, Fun) ->
-    {ok, Callbacks} = application:get_env(mnesia_cluster, cluster_monitor_callbacks),
-    [apply(M, Fun, [Node]) || M <- Callbacks],
-    ok.

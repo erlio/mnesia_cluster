@@ -37,7 +37,6 @@ handle_cast(_Req, State) ->
 handle_info(watch_app, {App, _}) ->
     {noreply, {App, is_app_alive(App)}};
 handle_info({'DOWN', _, process, _Pid, _Reason}, {App, _}) ->
-    monitor_callbacks(node(), on_node_down),
     {noreply, {App, is_app_alive(App)}}.
 
 terminate(_Reason, _State) ->
@@ -58,7 +57,6 @@ is_app_alive(App) ->
                     undefined;
                 {true, _} ->
                     mnesia_cluster_monitor:notify_node_up(),
-                    monitor_callbacks(node(), on_node_up),
                     monitor(process, Pid);
                 _ ->
                     erlang:send_after(?INTERVALL, self(), watch_app),
@@ -76,8 +74,3 @@ is_registered_process_alive(Name) ->
         Pid ->
             {is_process_alive(Pid), Pid}
     end.
-
-monitor_callbacks(Node, Fun) ->
-    {ok, Callbacks} = application:get_env(mnesia_cluster, cluster_monitor_callbacks),
-    [apply(M, Fun, [Node]) || M <- Callbacks],
-    ok.
