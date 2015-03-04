@@ -250,6 +250,7 @@ handle_cast({node_up, Node, NodeType},
                  {noreply, State#state{
                              monitors = mnesia_cluster_pmon:monitor({App, Node}, Monitors)}}
     end;
+
 handle_cast({joined_cluster, Node, NodeType}, State) ->
     {AllNodes, DiscNodes, RunningNodes} = read_cluster_status(),
     write_cluster_status({add_node(Node, AllNodes),
@@ -287,12 +288,11 @@ handle_info({nodedown, Node, Info}, State) ->
     error_logger:info_msg("node ~p down: ~p~n",
                     [Node, proplists:get_value(nodedown_reason, Info)]),
     {noreply, handle_dead_node(Node, State)};
-handle_info({nodeup, _, _}, State) ->
+handle_info({nodeup, Node, _}, State) ->
     %% we signal the app watcher to redeliver the app alive signal
     %% this will result in handle_cast({node_up.. on all running nodes
-    mnesia_cluster_app_watcher:rewatch(),
+    error_logger:info_msg("node ~p down~n", [Node]),
     {noreply, State};
-
 handle_info({mnesia_system_event,
              {inconsistent_database, running_partitioned_network, Node}},
             State = #state{app        = App,
