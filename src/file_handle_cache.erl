@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
+%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(file_handle_cache).
@@ -30,9 +30,9 @@
 %% may happen, especially for writes.
 %% 3) Writes are all appends. You cannot write to the middle of a
 %% file, although you can truncate and then append if you want.
-%% 4) Although there is a write buffer, there is no read buffer. Feel
-%% free to use the read_ahead mode, but beware of the interaction
-%% between that buffer and the write buffer.
+%% 4) There are read and write buffers. Feel free to use the read_ahead
+%% mode, but beware of the interaction between that buffer and the write
+%% buffer.
 %%
 %% Some benefits
 %% 1) You do not have to remember to call sync before close
@@ -140,15 +140,16 @@
 %% transfer are monitored, reducing the count of handles in use
 %% appropriately when the processes terminate.
 
--behaviour(gen_server).
+-behaviour(gen_server2).
 
 -export([register_callback/3]).
 -export([open/3, close/1, read/2, append/2, needs_sync/1, sync/1, position/2,
          truncate/1, current_virtual_offset/1, current_raw_offset/1, flush/1,
-         copy/3, set_maximum_since_use/1, delete/1, clear/1]).
+         copy/3, set_maximum_since_use/1, delete/1, clear/1,
+         open_with_absolute_path/3]).
 -export([obtain/0, obtain/1, release/0, release/1, transfer/1, transfer/2,
          set_limit/1, get_limit/0, info_keys/0, with_handle/1, with_handle/2,
-         info/0, info/1]).
+         info/0, info/1, clear_read_cache/0]).
 -export([ulimit/0]).
 
 -export([start_link/0, start_link/2, init/1, handle_call/3, handle_cast/2,
@@ -164,6 +165,8 @@
 -define(CLIENT_ETS_TABLE, file_handle_cache_client).
 -define(ELDERS_ETS_TABLE, file_handle_cache_elders).
 
+-include("rabbit.hrl"). % For #amqqueue record definition.
+
 %%----------------------------------------------------------------------------
 
 -record(file,
@@ -173,11 +176,18 @@
 
 -record(handle,
         { hdl,
+          ref,
           offset,
           is_dirty,
           write_buffer_size,
           write_buffer_size_limit,
           write_buffer,
+          read_buffer,
+          read_buffer_pos,
+          read_buffer_rem,        %% Num of bytes from pos to end
+          read_buffer_size,       %% Next size of read buffer to use
+          read_buffer_size_limit, %% Max size of read buffer to use
+          read_buffer_usage,      %% Bytes we have read from it, for tuning
           at_eof,
           path,
           mode,
@@ -223,6 +233,56 @@
 %%----------------------------------------------------------------------------
 %% Specs
 %%----------------------------------------------------------------------------
+
+-type ref() :: any().
+-type ok_or_error() :: 'ok' | {'error', any()}.
+-type val_or_error(T) :: {'ok', T} | {'error', any()}.
+-type position() :: ('bof' | 'eof' | non_neg_integer() |
+                     {('bof' |'eof'), non_neg_integer()} |
+                     {'cur', integer()}).
+-type offset() :: non_neg_integer().
+
+-spec register_callback(atom(), atom(), [any()]) -> 'ok'.
+-spec open
+        (file:filename(), [any()],
+         [{'write_buffer', (non_neg_integer() | 'infinity' | 'unbuffered')} |
+          {'read_buffer', (non_neg_integer() | 'unbuffered')}]) ->
+            val_or_error(ref()).
+-spec open_with_absolute_path
+        (file:filename(), [any()],
+         [{'write_buffer', (non_neg_integer() | 'infinity' | 'unbuffered')} |
+          {'read_buffer', (non_neg_integer() | 'unbuffered')}]) ->
+            val_or_error(ref()).
+-spec close(ref()) -> ok_or_error().
+-spec read
+        (ref(), non_neg_integer()) -> val_or_error([char()] | binary()) | 'eof'.
+-spec append(ref(), iodata()) -> ok_or_error().
+-spec sync(ref()) ->  ok_or_error().
+-spec position(ref(), position()) -> val_or_error(offset()).
+-spec truncate(ref()) -> ok_or_error().
+-spec current_virtual_offset(ref()) -> val_or_error(offset()).
+-spec current_raw_offset(ref()) -> val_or_error(offset()).
+-spec flush(ref()) -> ok_or_error().
+-spec copy(ref(), ref(), non_neg_integer()) -> val_or_error(non_neg_integer()).
+-spec delete(ref()) -> ok_or_error().
+-spec clear(ref()) -> ok_or_error().
+-spec set_maximum_since_use(non_neg_integer()) -> 'ok'.
+-spec obtain() -> 'ok'.
+-spec obtain(non_neg_integer()) -> 'ok'.
+-spec release() -> 'ok'.
+-spec release(non_neg_integer()) -> 'ok'.
+-spec transfer(pid()) -> 'ok'.
+-spec transfer(pid(), non_neg_integer()) -> 'ok'.
+-spec with_handle(fun(() -> A)) -> A.
+-spec with_handle(non_neg_integer(), fun(() -> A)) -> A.
+-spec set_limit(non_neg_integer()) -> 'ok'.
+-spec get_limit() -> non_neg_integer().
+-spec info_keys() -> rabbit_types:info_keys().
+-spec info() -> rabbit_types:infos().
+-spec info([atom()]) -> rabbit_types:infos().
+-spec ulimit() -> 'unknown' | non_neg_integer().
+
+%%----------------------------------------------------------------------------
 -define(INFO_KEYS, [total_limit, total_used, sockets_limit, sockets_used]).
 
 %%----------------------------------------------------------------------------
@@ -233,17 +293,19 @@ start_link() ->
     start_link(fun alarm_handler:set_alarm/1, fun alarm_handler:clear_alarm/1).
 
 start_link(AlarmSet, AlarmClear) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [AlarmSet, AlarmClear],
+    gen_server2:start_link({local, ?SERVER}, ?MODULE, [AlarmSet, AlarmClear],
                            [{timeout, infinity}]).
 
 register_callback(M, F, A)
   when is_atom(M) andalso is_atom(F) andalso is_list(A) ->
-    gen_server:cast(?SERVER, {register_callback, self(), {M, F, A}}).
+    gen_server2:cast(?SERVER, {register_callback, self(), {M, F, A}}).
 
 open(Path, Mode, Options) ->
-    Path1 = filename:absname(Path),
+    open_with_absolute_path(filename:absname(Path), Mode, Options).
+
+open_with_absolute_path(Path, Mode, Options) ->
     File1 = #file { reader_count = RCount, has_writer = HasWriter } =
-        case get({Path1, fhc_file}) of
+        case get({Path, fhc_file}) of
             File = #file {} -> File;
             undefined       -> #file { reader_count = 0,
                                        has_writer = false }
@@ -252,15 +314,15 @@ open(Path, Mode, Options) ->
     IsWriter = is_writer(Mode1),
     case IsWriter andalso HasWriter of
         true  -> {error, writer_exists};
-        false -> {ok, Ref} = new_closed_handle(Path1, Mode1, Options),
-                 case get_or_reopen([{Ref, new}]) of
+        false -> {ok, Ref} = new_closed_handle(Path, Mode1, Options),
+                 case get_or_reopen_timed([{Ref, new}]) of
                      {ok, [_Handle1]} ->
                          RCount1 = case is_reader(Mode1) of
                                        true  -> RCount + 1;
                                        false -> RCount
                                    end,
                          HasWriter1 = HasWriter orelse IsWriter,
-                         put({Path1, fhc_file},
+                         put({Path, fhc_file},
                              File1 #file { reader_count = RCount1,
                                            has_writer = HasWriter1 }),
                          {ok, Ref};
@@ -282,16 +344,65 @@ close(Ref) ->
 
 read(Ref, Count) ->
     with_flushed_handles(
-      [Ref],
+      [Ref], keep,
       fun ([#handle { is_read = false }]) ->
               {error, not_open_for_reading};
-          ([Handle = #handle { hdl = Hdl, offset = Offset }]) ->
-              case prim_file:read(Hdl, Count) of
-                  {ok, Data} = Obj -> Offset1 = Offset + iolist_size(Data),
-                                      {Obj,
-                                       [Handle #handle { offset = Offset1 }]};
-                  eof              -> {eof, [Handle #handle { at_eof = true }]};
-                  Error            -> {Error, [Handle]}
+          ([#handle{read_buffer_size_limit = 0,
+                    hdl = Hdl, offset = Offset} = Handle]) ->
+              %% The read buffer is disabled. This is just an
+              %% optimization: the clauses below can handle this case.
+              case prim_file_read(Hdl, Count) of
+                  {ok, Data} -> {{ok, Data},
+                                 [Handle#handle{offset = Offset+size(Data)}]};
+                  eof        -> {eof, [Handle #handle { at_eof = true }]};
+                  Error      -> {Error, Handle}
+              end;
+          ([Handle = #handle{read_buffer       = Buf,
+                             read_buffer_pos   = BufPos,
+                             read_buffer_rem   = BufRem,
+                             read_buffer_usage = BufUsg,
+                             offset            = Offset}])
+            when BufRem >= Count ->
+              <<_:BufPos/binary, Res:Count/binary, _/binary>> = Buf,
+              {{ok, Res}, [Handle#handle{offset            = Offset + Count,
+                                         read_buffer_pos   = BufPos + Count,
+                                         read_buffer_rem   = BufRem - Count,
+                                         read_buffer_usage = BufUsg + Count }]};
+          ([Handle0]) ->
+              maybe_reduce_read_cache([Ref]),
+              Handle = #handle{read_buffer      = Buf,
+                               read_buffer_pos  = BufPos,
+                               read_buffer_rem  = BufRem,
+                               read_buffer_size = BufSz,
+                               hdl              = Hdl,
+                               offset           = Offset}
+                  = tune_read_buffer_limit(Handle0, Count),
+              WantedCount = Count - BufRem,
+              case prim_file_read(Hdl, max(BufSz, WantedCount)) of
+                  {ok, Data} ->
+                      <<_:BufPos/binary, BufTl/binary>> = Buf,
+                      ReadCount = size(Data),
+                      case ReadCount < WantedCount of
+                          true ->
+                              OffSet1 = Offset + BufRem + ReadCount,
+                              {{ok, <<BufTl/binary, Data/binary>>},
+                               [reset_read_buffer(
+                                  Handle#handle{offset = OffSet1})]};
+                          false ->
+                              <<Hd:WantedCount/binary, _/binary>> = Data,
+                              OffSet1 = Offset + BufRem + WantedCount,
+                              BufRem1 = ReadCount - WantedCount,
+                              {{ok, <<BufTl/binary, Hd/binary>>},
+                               [Handle#handle{offset            = OffSet1,
+                                              read_buffer       = Data,
+                                              read_buffer_pos   = WantedCount,
+                                              read_buffer_rem   = BufRem1,
+                                              read_buffer_usage = WantedCount}]}
+                      end;
+                  eof ->
+                      {eof, [Handle #handle { at_eof = true }]};
+                  Error ->
+                      {Error, [reset_read_buffer(Handle)]}
               end
       end).
 
@@ -306,7 +417,7 @@ append(Ref, Data) ->
                                             write_buffer_size_limit = 0,
                                             at_eof = true } = Handle1} ->
                       Offset1 = Offset + iolist_size(Data),
-                      {prim_file:write(Hdl, Data),
+                      {prim_file_write(Hdl, Data),
                        [Handle1 #handle { is_dirty = true, offset = Offset1 }]};
                   {{ok, _Offset}, #handle { write_buffer = WriteBuffer,
                                             write_buffer_size = Size,
@@ -328,12 +439,12 @@ append(Ref, Data) ->
 
 sync(Ref) ->
     with_flushed_handles(
-      [Ref],
+      [Ref], keep,
       fun ([#handle { is_dirty = false, write_buffer = [] }]) ->
               ok;
           ([Handle = #handle { hdl = Hdl,
                                is_dirty = true, write_buffer = [] }]) ->
-              case prim_file:sync(Hdl) of
+              case prim_file_sync(Hdl) of
                   ok    -> {ok, [Handle #handle { is_dirty = false }]};
                   Error -> {Error, [Handle]}
               end
@@ -348,7 +459,7 @@ needs_sync(Ref) ->
 
 position(Ref, NewOffset) ->
     with_flushed_handles(
-      [Ref],
+      [Ref], keep,
       fun ([Handle]) -> {Result, Handle1} = maybe_seek(NewOffset, Handle),
                         {Result, [Handle1]}
       end).
@@ -416,8 +527,8 @@ clear(Ref) ->
       fun ([#handle { at_eof = true, write_buffer_size = 0, offset = 0 }]) ->
               ok;
           ([Handle]) ->
-              case maybe_seek(bof, Handle #handle { write_buffer = [],
-                                                    write_buffer_size = 0 }) of
+              case maybe_seek(bof, Handle#handle{write_buffer      = [],
+                                                 write_buffer_size = 0}) of
                   {{ok, 0}, Handle1 = #handle { hdl = Hdl }} ->
                       case prim_file:truncate(Hdl) of
                           ok    -> {ok, [Handle1 #handle { at_eof = true }]};
@@ -429,12 +540,15 @@ clear(Ref) ->
       end).
 
 set_maximum_since_use(MaximumAge) ->
-    Now = now(),
+    Now = time_compat:monotonic_time(),
     case lists:foldl(
            fun ({{Ref, fhc_handle},
                  Handle = #handle { hdl = Hdl, last_used_at = Then }}, Rep) ->
                    case Hdl =/= closed andalso
-                       timer:now_diff(Now, Then) >= MaximumAge of
+                        time_compat:convert_time_unit(Now - Then,
+                                                      native,
+                                                      micro_seconds)
+                          >= MaximumAge of
                        true  -> soft_close(Ref, Handle) orelse Rep;
                        false -> Rep
                    end;
@@ -465,30 +579,86 @@ obtain(Count, Type) when Count > 0 ->
     %% If the FHC isn't running, obtains succeed immediately.
     case whereis(?SERVER) of
         undefined -> ok;
-        _         -> gen_server:call(
+        _         -> gen_server2:call(
                        ?SERVER, {obtain, Count, Type, self()}, infinity)
     end.
 
 release(Count, Type) when Count > 0 ->
-    gen_server:cast(?SERVER, {release, Count, Type, self()}).
+    gen_server2:cast(?SERVER, {release, Count, Type, self()}).
 
 transfer(Pid, Count) when Count > 0 ->
-    gen_server:cast(?SERVER, {transfer, Count, self(), Pid}).
+    gen_server2:cast(?SERVER, {transfer, Count, self(), Pid}).
 
 set_limit(Limit) ->
-    gen_server:call(?SERVER, {set_limit, Limit}, infinity).
+    gen_server2:call(?SERVER, {set_limit, Limit}, infinity).
 
 get_limit() ->
-    gen_server:call(?SERVER, get_limit, infinity).
+    gen_server2:call(?SERVER, get_limit, infinity).
 
 info_keys() -> ?INFO_KEYS.
 
 info() -> info(?INFO_KEYS).
-info(Items) -> gen_server:call(?SERVER, {info, Items}, infinity).
+info(Items) -> gen_server2:call(?SERVER, {info, Items}, infinity).
+
+clear_read_cache() ->
+    case application:get_env(rabbit, fhc_read_buffering) of
+        {ok, true} ->
+            gen_server2:cast(?SERVER, clear_read_cache),
+            clear_vhost_read_cache(rabbit_vhost:list());
+        _ -> %% undefined or {ok, false}
+            ok
+    end.
+
+clear_vhost_read_cache([]) ->
+    ok;
+clear_vhost_read_cache([VHost | Rest]) ->
+    clear_queue_read_cache(rabbit_amqqueue:list(VHost)),
+    clear_vhost_read_cache(Rest).
+
+clear_queue_read_cache([]) ->
+    ok;
+clear_queue_read_cache([#amqqueue{pid = MPid, slave_pids = SPids} | Rest]) ->
+    %% Limit the action to the current node.
+    Pids = [P || P <- [MPid | SPids], node(P) =:= node()],
+    %% This function is executed in the context of the backing queue
+    %% process because the read buffer is stored in the process
+    %% dictionary.
+    Fun = fun(_, State) ->
+                  _ = clear_process_read_cache(),
+                  State
+          end,
+    [rabbit_amqqueue:run_backing_queue(Pid, rabbit_variable_queue, Fun)
+     || Pid <- Pids],
+    clear_queue_read_cache(Rest).
+
+clear_process_read_cache() ->
+    [
+     begin
+         Handle1 = reset_read_buffer(Handle),
+         put({Ref, fhc_handle}, Handle1)
+     end ||
+        {{Ref, fhc_handle}, Handle} <- get(),
+        size(Handle#handle.read_buffer) > 0
+    ].
 
 %%----------------------------------------------------------------------------
 %% Internal functions
 %%----------------------------------------------------------------------------
+
+prim_file_read(Hdl, Size) ->
+    file_handle_cache_stats:update(
+      io_read, Size, fun() -> prim_file:read(Hdl, Size) end).
+
+prim_file_write(Hdl, Bytes) ->
+    file_handle_cache_stats:update(
+      io_write, iolist_size(Bytes), fun() -> prim_file:write(Hdl, Bytes) end).
+
+prim_file_sync(Hdl) ->
+    file_handle_cache_stats:update(io_sync, fun() -> prim_file:sync(Hdl) end).
+
+prim_file_position(Hdl, NewOffset) ->
+    file_handle_cache_stats:update(
+      io_seek, fun() -> prim_file:position(Hdl, NewOffset) end).
 
 is_reader(Mode) -> lists:member(read, Mode).
 
@@ -501,11 +671,18 @@ append_to_write(Mode) ->
     end.
 
 with_handles(Refs, Fun) ->
-    case get_or_reopen([{Ref, reopen} || Ref <- Refs]) of
-        {ok, Handles} ->
+    with_handles(Refs, reset, Fun).
+
+with_handles(Refs, ReadBuffer, Fun) ->
+    case get_or_reopen_timed([{Ref, reopen} || Ref <- Refs]) of
+        {ok, Handles0} ->
+            Handles = case ReadBuffer of
+                          reset -> [reset_read_buffer(H) || H <- Handles0];
+                          keep  -> Handles0
+                      end,
             case Fun(Handles) of
                 {Result, Handles1} when is_list(Handles1) ->
-                    lists:zipwith(fun put_handle/2, Refs, Handles1),
+                    _ = lists:zipwith(fun put_handle/2, Refs, Handles1),
                     Result;
                 Result ->
                     Result
@@ -515,8 +692,11 @@ with_handles(Refs, Fun) ->
     end.
 
 with_flushed_handles(Refs, Fun) ->
+    with_flushed_handles(Refs, reset, Fun).
+
+with_flushed_handles(Refs, ReadBuffer, Fun) ->
     with_handles(
-      Refs,
+      Refs, ReadBuffer,
       fun (Handles) ->
               case lists:foldl(
                      fun (Handle, {ok, HandlesAcc}) ->
@@ -532,13 +712,18 @@ with_flushed_handles(Refs, Fun) ->
               end
       end).
 
+get_or_reopen_timed(RefNewOrReopens) ->
+    file_handle_cache_stats:update(
+      io_file_handle_open_attempt, fun() -> get_or_reopen(RefNewOrReopens) end).
+
 get_or_reopen(RefNewOrReopens) ->
     case partition_handles(RefNewOrReopens) of
         {OpenHdls, []} ->
             {ok, [Handle || {_Ref, Handle} <- OpenHdls]};
         {OpenHdls, ClosedHdls} ->
-            Oldest = oldest(get_age_tree(), fun () -> now() end),
-            case gen_server:call(?SERVER, {open, self(), length(ClosedHdls),
+            Oldest = oldest(get_age_tree(),
+                            fun () -> time_compat:monotonic_time() end),
+            case gen_server2:call(?SERVER, {open, self(), length(ClosedHdls),
                                             Oldest}, infinity) of
                 ok ->
                     case reopen(ClosedHdls) of
@@ -562,27 +747,30 @@ reopen([], Tree, RefHdls) ->
     {ok, lists:reverse(RefHdls)};
 reopen([{Ref, NewOrReopen, Handle = #handle { hdl          = closed,
                                               path         = Path,
-                                              mode         = Mode,
+                                              mode         = Mode0,
                                               offset       = Offset,
                                               last_used_at = undefined }} |
         RefNewOrReopenHdls] = ToOpen, Tree, RefHdls) ->
-    case prim_file:open(Path, case NewOrReopen of
-                                  new    -> Mode;
-                                  reopen -> [read | Mode]
-                              end) of
+    Mode = case NewOrReopen of
+               new    -> Mode0;
+               reopen -> file_handle_cache_stats:update(io_reopen),
+                         [read | Mode0]
+           end,
+    case prim_file:open(Path, Mode) of
         {ok, Hdl} ->
-            Now = now(),
+            Now = time_compat:monotonic_time(),
             {{ok, _Offset}, Handle1} =
-                maybe_seek(Offset, Handle #handle { hdl          = Hdl,
-                                                    offset       = 0,
-                                                    last_used_at = Now }),
+                maybe_seek(Offset, reset_read_buffer(
+                                     Handle#handle{hdl              = Hdl,
+                                                   offset           = 0,
+                                                   last_used_at     = Now})),
             put({Ref, fhc_handle}, Handle1),
-            reopen(RefNewOrReopenHdls, gb_trees:insert(Now, Ref, Tree),
+            reopen(RefNewOrReopenHdls, gb_trees:insert({Now, Ref}, true, Tree),
                    [{Ref, Handle1} | RefHdls]);
         Error ->
             %% NB: none of the handles in ToOpen are in the age tree
             Oldest = oldest(Tree, fun () -> undefined end),
-            [gen_server:cast(?SERVER, {close, self(), Oldest}) || _ <- ToOpen],
+            [gen_server2:cast(?SERVER, {close, self(), Oldest}) || _ <- ToOpen],
             put_age_tree(Tree),
             Error
     end.
@@ -606,7 +794,7 @@ sort_handles([{Ref, _} | RefHdls], RefHdlsA, [{Ref, Handle} | RefHdlsB], Acc) ->
     sort_handles(RefHdls, RefHdlsA, RefHdlsB, [Handle | Acc]).
 
 put_handle(Ref, Handle = #handle { last_used_at = Then }) ->
-    Now = now(),
+    Now = time_compat:monotonic_time(),
     age_tree_update(Then, Now, Ref),
     put({Ref, fhc_handle}, Handle #handle { last_used_at = Now }).
 
@@ -623,15 +811,16 @@ put_age_tree(Tree) -> put(fhc_age_tree, Tree).
 age_tree_update(Then, Now, Ref) ->
     with_age_tree(
       fun (Tree) ->
-              gb_trees:insert(Now, Ref, gb_trees:delete_any(Then, Tree))
+              gb_trees:insert({Now, Ref}, true,
+                              gb_trees:delete_any({Then, Ref}, Tree))
       end).
 
-age_tree_delete(Then) ->
+age_tree_delete(Then, Ref) ->
     with_age_tree(
       fun (Tree) ->
-              Tree1 = gb_trees:delete_any(Then, Tree),
+              Tree1 = gb_trees:delete_any({Then, Ref}, Tree),
               Oldest = oldest(Tree1, fun () -> undefined end),
-              gen_server:cast(?SERVER, {close, self(), Oldest}),
+              gen_server2:cast(?SERVER, {close, self(), Oldest}),
               Tree1
       end).
 
@@ -640,33 +829,53 @@ age_tree_change() ->
       fun (Tree) ->
               case gb_trees:is_empty(Tree) of
                   true  -> Tree;
-                  false -> {Oldest, _Ref} = gb_trees:smallest(Tree),
-                           gen_server:cast(?SERVER, {update, self(), Oldest})
-              end,
-              Tree
+                  false -> {{Oldest, _Ref}, _} = gb_trees:smallest(Tree),
+                           gen_server2:cast(?SERVER, {update, self(), Oldest}),
+                           Tree
+              end
       end).
 
 oldest(Tree, DefaultFun) ->
     case gb_trees:is_empty(Tree) of
         true  -> DefaultFun();
-        false -> {Oldest, _Ref} = gb_trees:smallest(Tree),
+        false -> {{Oldest, _Ref}, _} = gb_trees:smallest(Tree),
                  Oldest
     end.
 
 new_closed_handle(Path, Mode, Options) ->
     WriteBufferSize =
-        case proplists:get_value(write_buffer, Options, unbuffered) of
-            unbuffered           -> 0;
-            infinity             -> infinity;
-            N when is_integer(N) -> N
+        case application:get_env(rabbit, fhc_write_buffering) of
+            {ok, false} -> 0;
+            {ok, true}  ->
+                case proplists:get_value(write_buffer, Options, unbuffered) of
+                    unbuffered           -> 0;
+                    infinity             -> infinity;
+                    N when is_integer(N) -> N
+                end
+        end,
+    ReadBufferSize =
+        case application:get_env(rabbit, fhc_read_buffering) of
+            {ok, false} -> 0;
+            {ok, true}  ->
+                case proplists:get_value(read_buffer, Options, unbuffered) of
+                    unbuffered             -> 0;
+                    N2 when is_integer(N2) -> N2
+                end
         end,
     Ref = make_ref(),
     put({Ref, fhc_handle}, #handle { hdl                     = closed,
+                                     ref                     = Ref,
                                      offset                  = 0,
                                      is_dirty                = false,
                                      write_buffer_size       = 0,
                                      write_buffer_size_limit = WriteBufferSize,
                                      write_buffer            = [],
+                                     read_buffer             = <<>>,
+                                     read_buffer_pos         = 0,
+                                     read_buffer_rem         = 0,
+                                     read_buffer_size        = ReadBufferSize,
+                                     read_buffer_size_limit  = ReadBufferSize,
+                                     read_buffer_usage       = 0,
                                      at_eof                  = false,
                                      path                    = Path,
                                      mode                    = Mode,
@@ -690,14 +899,15 @@ soft_close(Handle = #handle { hdl = closed }) ->
 soft_close(Handle) ->
     case write_buffer(Handle) of
         {ok, #handle { hdl         = Hdl,
+                       ref         = Ref,
                        is_dirty    = IsDirty,
                        last_used_at = Then } = Handle1 } ->
             ok = case IsDirty of
-                     true  -> prim_file:sync(Hdl);
+                     true  -> prim_file_sync(Hdl);
                      false -> ok
                  end,
             ok = prim_file:close(Hdl),
-            age_tree_delete(Then),
+            age_tree_delete(Then, Ref),
             {ok, Handle1 #handle { hdl            = closed,
                                    is_dirty       = false,
                                    last_used_at   = undefined }};
@@ -727,17 +937,31 @@ hard_close(Handle) ->
             Result
     end.
 
-maybe_seek(NewOffset, Handle = #handle { hdl = Hdl, offset = Offset,
-                                         at_eof = AtEoF }) ->
-    {AtEoF1, NeedsSeek} = needs_seek(AtEoF, Offset, NewOffset),
-    case (case NeedsSeek of
-              true  -> prim_file:position(Hdl, NewOffset);
-              false -> {ok, Offset}
-          end) of
-        {ok, Offset1} = Result ->
-            {Result, Handle #handle { offset = Offset1, at_eof = AtEoF1 }};
-        {error, _} = Error ->
-            {Error, Handle}
+maybe_seek(New, Handle = #handle{hdl              = Hdl,
+                                 offset           = Old,
+                                 read_buffer_pos  = BufPos,
+                                 read_buffer_rem  = BufRem,
+                                 at_eof           = AtEoF}) ->
+    {AtEoF1, NeedsSeek} = needs_seek(AtEoF, Old, New),
+    case NeedsSeek of
+        true when is_number(New) andalso
+                  ((New >= Old andalso New =< BufRem + Old)
+                   orelse (New < Old andalso Old - New =< BufPos)) ->
+            Diff = New - Old,
+            {{ok, New}, Handle#handle{offset          = New,
+                                      at_eof          = AtEoF1,
+                                      read_buffer_pos = BufPos + Diff,
+                                      read_buffer_rem = BufRem - Diff}};
+        true ->
+            case prim_file_position(Hdl, New) of
+                {ok, Offset1} = Result ->
+                    {Result, reset_read_buffer(Handle#handle{offset = Offset1,
+                                                             at_eof = AtEoF1})};
+                {error, _} = Error ->
+                    {Error, Handle}
+            end;
+        false ->
+            {{ok, Old}, Handle}
     end.
 
 needs_seek( AtEoF, _CurOffset,  cur     ) -> {AtEoF, false};
@@ -768,13 +992,82 @@ write_buffer(Handle = #handle { hdl = Hdl, offset = Offset,
                                 write_buffer = WriteBuffer,
                                 write_buffer_size = DataSize,
                                 at_eof = true }) ->
-    case prim_file:write(Hdl, lists:reverse(WriteBuffer)) of
+    case prim_file_write(Hdl, lists:reverse(WriteBuffer)) of
         ok ->
             Offset1 = Offset + DataSize,
             {ok, Handle #handle { offset = Offset1, is_dirty = true,
                                   write_buffer = [], write_buffer_size = 0 }};
         {error, _} = Error ->
             {Error, Handle}
+    end.
+
+reset_read_buffer(Handle) ->
+    Handle#handle{read_buffer     = <<>>,
+                  read_buffer_pos = 0,
+                  read_buffer_rem = 0}.
+
+%% We come into this function whenever there's been a miss while
+%% reading from the buffer - but note that when we first start with a
+%% new handle the usage will be 0.  Therefore in that case don't take
+%% it as meaning the buffer was useless, we just haven't done anything
+%% yet!
+tune_read_buffer_limit(Handle = #handle{read_buffer_usage = 0}, _Count) ->
+    Handle;
+%% In this head we have been using the buffer but now tried to read
+%% outside it. So how did we do? If we used less than the size of the
+%% buffer, make the new buffer the size of what we used before, but
+%% add one byte (so that next time we can distinguish between getting
+%% the buffer size exactly right and actually wanting more). If we
+%% read 100% of what we had, then double it for next time, up to the
+%% limit that was set when we were created.
+tune_read_buffer_limit(Handle = #handle{read_buffer            = Buf,
+                                        read_buffer_usage      = Usg,
+                                        read_buffer_size       = Sz,
+                                        read_buffer_size_limit = Lim}, Count) ->
+    %% If the buffer is <<>> then we are in the first read after a
+    %% reset, the read_buffer_usage is the total usage from before the
+    %% reset. But otherwise we are in a read which read off the end of
+    %% the buffer, so really the size of this read should be included
+    %% in the usage.
+    TotalUsg = case Buf of
+                   <<>> -> Usg;
+                   _    -> Usg + Count
+               end,
+    Handle#handle{read_buffer_usage = 0,
+                  read_buffer_size  = erlang:min(case TotalUsg < Sz of
+                                                     true  -> Usg + 1;
+                                                     false -> Usg * 2
+                                                 end, Lim)}.
+
+maybe_reduce_read_cache(SparedRefs) ->
+    case rabbit_memory_monitor:memory_use(bytes) of
+        {_, infinity}                             -> ok;
+        {MemUse, MemLimit} when MemUse < MemLimit -> ok;
+        {MemUse, MemLimit}                        -> reduce_read_cache(
+                                                       (MemUse - MemLimit) * 2,
+                                                       SparedRefs)
+    end.
+
+reduce_read_cache(MemToFree, SparedRefs) ->
+    Handles = lists:sort(
+      fun({_, H1}, {_, H2}) -> H1 < H2 end,
+      [{R, H} || {{R, fhc_handle}, H} <- get(),
+                 not lists:member(R, SparedRefs)
+                 andalso size(H#handle.read_buffer) > 0]),
+    FreedMem = lists:foldl(
+      fun
+          (_, Freed) when Freed >= MemToFree ->
+              Freed;
+          ({Ref, #handle{read_buffer = Buf} = Handle}, Freed) ->
+              Handle1 = reset_read_buffer(Handle),
+              put({Ref, fhc_handle}, Handle1),
+              Freed + size(Buf)
+      end, 0, Handles),
+    if
+        FreedMem < MemToFree andalso SparedRefs =/= [] ->
+            reduce_read_cache(MemToFree - FreedMem, []);
+        true ->
+            ok
     end.
 
 infos(Items, State) -> [{Item, i(Item, State)} || Item <- Items].
@@ -790,10 +1083,11 @@ used(#fhc_state{open_count          = C1,
                  obtain_count_file   = C3}) -> C1 + C2 + C3.
 
 %%----------------------------------------------------------------------------
-%% gen_server callbacks
+%% gen_server2 callbacks
 %%----------------------------------------------------------------------------
 
 init([AlarmSet, AlarmClear]) ->
+    _ = file_handle_cache_stats:init(),
     Limit = case application:get_env(file_handles_high_watermark) of
                 {ok, Watermark} when (is_integer(Watermark) andalso
                                       Watermark > 0) ->
@@ -929,7 +1223,11 @@ handle_cast({transfer, N, FromPid, ToPid}, State) ->
     {noreply, process_pending(
                 update_counts({obtain, socket}, ToPid, +N,
                               update_counts({obtain, socket}, FromPid, -N,
-                                            State)))}.
+                                            State)))};
+
+handle_cast(clear_read_cache, State) ->
+    _ = clear_process_read_cache(),
+    {noreply, State}.
 
 handle_info(check_counts, State) ->
     {noreply, maybe_reduce(State #fhc_state { timer_ref = undefined })};
@@ -1006,11 +1304,6 @@ pending_out({N, Queue}) ->
 pending_count({Count, _Queue}) ->
     Count.
 
-pending_is_empty({0, _Queue}) ->
-    true;
-pending_is_empty({_N, _Queue}) ->
-    false.
-
 %%----------------------------------------------------------------------------
 %% server helpers
 %%----------------------------------------------------------------------------
@@ -1057,17 +1350,24 @@ process_open(State = #fhc_state { limit        = Limit,
     {Pending1, State1} = process_pending(Pending, Limit - used(State), State),
     State1 #fhc_state { open_pending = Pending1 }.
 
-process_obtain(Type, State = #fhc_state { limit        = Limit,
-                                          obtain_limit = ObtainLimit }) ->
-    ObtainCount = obtain_state(Type, count, State),
-    Pending = obtain_state(Type, pending, State),
-    Quota = case Type of
-                file   -> Limit - (used(State));
-                socket -> lists:min([ObtainLimit - ObtainCount,
-                                     Limit - (used(State))])
-            end,
+process_obtain(socket, State = #fhc_state { limit        = Limit,
+                                            obtain_limit = ObtainLimit,
+                                            open_count = OpenCount,
+                                            obtain_count_socket = ObtainCount,
+                                            obtain_pending_socket = Pending,
+                                            obtain_count_file = ObtainCountF}) ->
+    Quota = min(ObtainLimit - ObtainCount,
+                Limit - (OpenCount + ObtainCount + ObtainCountF)),
     {Pending1, State1} = process_pending(Pending, Quota, State),
-    set_obtain_state(Type, pending, Pending1, State1).
+    State1#fhc_state{obtain_pending_socket = Pending1};
+process_obtain(file, State = #fhc_state { limit        = Limit,
+                                          open_count = OpenCount,
+                                          obtain_count_socket = ObtainCountS,
+                                          obtain_count_file = ObtainCountF,
+                                          obtain_pending_file = Pending}) ->
+    Quota = Limit - (OpenCount + ObtainCountS + ObtainCountF),
+    {Pending1, State1} = process_pending(Pending, Quota, State),
+    State1#fhc_state{obtain_pending_file = Pending1}.
 
 process_pending(Pending, Quota, State) when Quota =< 0 ->
     {Pending, State};
@@ -1088,30 +1388,25 @@ run_pending_item(#pending { kind      = Kind,
                             requested = Requested,
                             from      = From },
                  State = #fhc_state { clients = Clients }) ->
-    gen_server:reply(From, ok),
+    gen_server2:reply(From, ok),
     true = ets:update_element(Clients, Pid, {#cstate.blocked, false}),
     update_counts(Kind, Pid, Requested, State).
 
-update_counts(Kind, Pid, Delta,
+update_counts(open, Pid, Delta,
               State = #fhc_state { open_count          = OpenCount,
-                                   obtain_count_file   = ObtainCountF,
-                                   obtain_count_socket = ObtainCountS,
                                    clients             = Clients }) ->
-    {OpenDelta, ObtainDeltaF, ObtainDeltaS} =
-        update_counts1(Kind, Pid, Delta, Clients),
-    State #fhc_state { open_count          = OpenCount    + OpenDelta,
-                       obtain_count_file   = ObtainCountF + ObtainDeltaF,
-                       obtain_count_socket = ObtainCountS + ObtainDeltaS }.
-
-update_counts1(open, Pid, Delta, Clients) ->
     ets:update_counter(Clients, Pid, {#cstate.opened, Delta}),
-    {Delta, 0, 0};
-update_counts1({obtain, file}, Pid, Delta, Clients) ->
+    State #fhc_state { open_count = OpenCount + Delta};
+update_counts({obtain, file}, Pid, Delta,
+              State = #fhc_state {obtain_count_file   = ObtainCountF,
+                                  clients             = Clients }) ->
     ets:update_counter(Clients, Pid, {#cstate.obtained_file, Delta}),
-    {0, Delta, 0};
-update_counts1({obtain, socket}, Pid, Delta, Clients) ->
+    State #fhc_state { obtain_count_file = ObtainCountF + Delta};
+update_counts({obtain, socket}, Pid, Delta,
+              State = #fhc_state {obtain_count_socket   = ObtainCountS,
+                                  clients             = Clients }) ->
     ets:update_counter(Clients, Pid, {#cstate.obtained_socket, Delta}),
-    {0, 0, Delta}.
+    State #fhc_state { obtain_count_socket = ObtainCountS + Delta}.
 
 maybe_reduce(State) ->
     case needs_reduce(State) of
@@ -1119,18 +1414,20 @@ maybe_reduce(State) ->
         false -> State
     end.
 
-needs_reduce(State = #fhc_state { limit                 = Limit,
-                                  open_pending          = OpenPending,
-                                  obtain_limit          = ObtainLimit,
-                                  obtain_count_socket   = ObtainCountS,
-                                  obtain_pending_file   = ObtainPendingF,
-                                  obtain_pending_socket = ObtainPendingS }) ->
+needs_reduce(#fhc_state { limit                 = Limit,
+                          open_count            = OpenCount,
+                          open_pending          = {OpenPending, _},
+                          obtain_limit          = ObtainLimit,
+                          obtain_count_socket   = ObtainCountS,
+                          obtain_count_file     = ObtainCountF,
+                          obtain_pending_file   = {ObtainPendingF, _},
+                          obtain_pending_socket = {ObtainPendingS, _} }) ->
     Limit =/= infinity
-        andalso ((used(State) > Limit)
-                 orelse (not pending_is_empty(OpenPending))
-                 orelse (not pending_is_empty(ObtainPendingF))
+        andalso (((OpenCount + ObtainCountS + ObtainCountF) > Limit)
+                 orelse (OpenPending =/= 0)
+                 orelse (ObtainPendingF =/= 0)
                  orelse (ObtainCountS < ObtainLimit
-                         andalso not pending_is_empty(ObtainPendingS))).
+                         andalso (ObtainPendingS =/= 0))).
 
 reduce(State = #fhc_state { open_pending          = OpenPending,
                             obtain_pending_file   = ObtainPendingFile,
@@ -1138,17 +1435,19 @@ reduce(State = #fhc_state { open_pending          = OpenPending,
                             elders                = Elders,
                             clients               = Clients,
                             timer_ref             = TRef }) ->
-    Now = now(),
+    Now = time_compat:monotonic_time(),
     {CStates, Sum, ClientCount} =
         ets:foldl(fun ({Pid, Eldest}, {CStatesAcc, SumAcc, CountAcc} = Accs) ->
                           [#cstate { pending_closes = PendingCloses,
                                      opened         = Opened,
                                      blocked        = Blocked } = CState] =
                               ets:lookup(Clients, Pid),
+                          TimeDiff = time_compat:convert_time_unit(
+                            Now - Eldest, native, micro_seconds),
                           case Blocked orelse PendingCloses =:= Opened of
                               true  -> Accs;
                               false -> {[CState | CStatesAcc],
-                                        SumAcc + timer:now_diff(Now, Eldest),
+                                        SumAcc + TimeDiff,
                                         CountAcc + 1}
                           end
                   end, {[], 0, 0}, Elders),
@@ -1182,7 +1481,7 @@ notify_age(CStates, AverageAge) ->
 notify_age0(Clients, CStates, Required) ->
     case [CState || CState <- CStates, CState#cstate.callback =/= undefined] of
         []            -> ok;
-        Notifications -> S = random:uniform(length(Notifications)),
+        Notifications -> S = rand_compat:uniform(length(Notifications)),
                          {L1, L2} = lists:split(S, Notifications),
                          notify(Clients, Required, L2 ++ L1)
     end.
@@ -1229,4 +1528,3 @@ ulimit() ->
         _ ->
             unknown
     end.
-
